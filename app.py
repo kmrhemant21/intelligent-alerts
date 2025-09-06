@@ -1,541 +1,420 @@
-# app.py
-import os
-import re
-import json
-import time
-import asyncio
-import logging
-from collections import Counter
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, List, Optional, Tuple
+#!/usr/bin/env python3
+from __future__ import annotations
+import os, json, logging, asyncio, datetime as dt, re, hashlib
+from typing import Tuple, Optional, Dict, Any, List
 
 import httpx
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from dateutil import parser as dateparser
 
-# ------------------ Logging ------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-LOG_JSON = os.getenv("LOG_JSON", "false").lower() == "true"
-LOG_PAYLOAD_FULL = os.getenv("LOG_PAYLOAD_FULL", "true").lower() == "true"
-LOG_EXCERPT_CHARS = int(os.getenv("LOG_EXCERPT_CHARS", "800"))
-LOG_LINES_SAMPLE = int(os.getenv("LOG_LINES_SAMPLE", "20"))
+# -------- Config from env --------
+PORT                     = int(os.getenv("PORT", "8080"))
+ALERT_WEBHOOK_PATH       = os.getenv("ALERT_WEBHOOK_PATH", "/alert")
 
-def _setup_logger():
-    level = getattr(logging, LOG_LEVEL, logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)s %(name)s %(message)s"
-    )
-    return logging.getLogger("llm-relay")
+LOKI_URL                 = (os.getenv("LOKI_URL", "http://loki:3100")).rstrip("/")
+LOKI_TENANT_ID           = os.getenv("LOKI_TENANT_ID") or None
+LOKI_BEARER_TOKEN        = os.getenv("LOKI_BEARER_TOKEN") or None
+LOKI_BASIC_USER          = os.getenv("LOKI_BASIC_USER") or None  # NEW
+LOKI_BASIC_PASS          = os.getenv("LOKI_BASIC_PASS") or None  # NEW
 
-logger = _setup_logger()
+OLLAMA_URL               = (os.getenv("OLLAMA_URL", "http://ollama:11434")).rstrip("/")
+OLLAMA_MODEL             = os.getenv("OLLAMA_MODEL", "llama3.2:latest")
 
-def _truncate(s: str, n: int = LOG_EXCERPT_CHARS) -> str:
-    if s is None:
-        return ""
-    return s if len(s) <= n else s[: n - 3] + "..."
+PROM2TEAMS_BASE          = (os.getenv("PROM2TEAMS_BASE", "http://prom2teams:8089")).rstrip("/")
+PROM2TEAMS_CONNECTOR     = (os.getenv("PROM2TEAMS_CONNECTOR", "Connector")).rstrip("/")
 
-def _j(event: str, **fields):
-    """Emit a structured log line."""
+LOG_WINDOW_BEFORE_SEC    = int(os.getenv("LOG_WINDOW_BEFORE_SEC", "900"))   # 15m before startsAt
+LOG_WINDOW_AFTER_SEC     = int(os.getenv("LOG_WINDOW_AFTER_SEC", "300"))    # 5m after endsAt/now
+MAX_LOG_LINES            = int(os.getenv("MAX_LOG_LINES", "100"))
+
+OLLAMA_TIMEOUT_S = float(os.getenv("OLLAMA_TIMEOUT_S", "180"))  # bump default timeout
+OLLAMA_API_STYLE = "generate" #os.getenv("OLLAMA_API_STYLE", "auto") 
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("intelligent-alert")
+
+app = FastAPI(title="intelligent-alert", version="1.1.0")
+
+# -------- Helpers --------
+def clamp(s: str, max_chars: int = 12000) -> str:
+    if len(s) <= max_chars:
+        return s
+    return s[: max_chars // 2] + "\n...\n" + s[-max_chars // 2 :]
+
+def to_ns(t: dt.datetime) -> int:
+    return int(t.timestamp() * 1_000_000_000)
+
+def parse_time(iso: str) -> dt.datetime:
+    return dateparser.isoparse(iso)
+
+def sha1(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+import os, re
+
+LLM_MAX_PROMPT_CHARS = int(os.getenv("LLM_MAX_PROMPT_CHARS", "4000"))  # clamp for LLM
+LOG_FILTER_REGEX     = os.getenv("LOG_FILTER_REGEX", r"(error|exception|timeout|refused|unhealthy|oom|panic|fail|deadline)")  # optional
+OLLAMA_NUM_CTX       = int(os.getenv("OLLAMA_NUM_CTX", "4096"))  # used if model supports
+
+def clamp_for_llm(text: str) -> str:
+    # keep only lines that match regex (if provided), then clamp to char budget
     try:
-        if LOG_JSON:
-            payload = {"event": event, **fields}
-            logger.info(json.dumps(payload, default=str, ensure_ascii=False))
-        else:
-            logger.info("%s | %s", event, _truncate(json.dumps(fields, default=str, ensure_ascii=False)))
-    except Exception as e:
-        logger.warning("log_emit_failed %s %s", event, e)
+        pat = re.compile(LOG_FILTER_REGEX, re.IGNORECASE) if LOG_FILTER_REGEX else None
+    except re.error:
+        pat = None
+    lines = text.splitlines()
+    if pat:
+        filt = [ln for ln in lines if pat.search(ln)]
+        # if filtering kills everything, fall back to the last ~200 lines
+        if len(filt) < 5:
+            filt = lines[-200:]
+    else:
+        filt = lines[-200:]
+    joined = "\n".join(filt)
+    return joined if len(joined) <= LLM_MAX_PROMPT_CHARS else joined[:LLM_MAX_PROMPT_CHARS]
 
-# ---- LangChain (Ollama) ----
-from langchain_ollama import ChatOllama
-from langchain.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-
-# ------------------ ENV ------------------
-LOKI_URL: str = os.getenv("LOKI_URL", "http://loki:3100")
-LOKI_BEARER_TOKEN: Optional[str] = os.getenv("LOKI_BEARER_TOKEN")
-LOKI_BASIC_USER: Optional[str] = os.getenv("LOKI_BASIC_USER")
-LOKI_BASIC_PASS: Optional[str] = os.getenv("LOKI_BASIC_PASS")
-LOKI_TENANT_ID: Optional[str] = os.getenv("LOKI_TENANT_ID")
-
-OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.1")
-OLLAMA_URL: str = os.getenv("OLLAMA_URL", "http://ollama:11434")
-OLLAMA_TEMPERATURE: float = float(os.getenv("OLLAMA_TEMPERATURE", "0"))
-LLM_TIMEOUT_SEC: float = float(os.getenv("LLM_TIMEOUT_SEC", "25"))
-
-P2T_BASE: str = os.getenv("P2T_BASE", "http://prom2teams.monitoring.svc.cluster.local:8089")
-P2T_CONNECTOR: str = os.getenv("P2T_CONNECTOR", "default")
-
-LOG_WINDOW_MIN: int = int(os.getenv("LOG_WINDOW_MIN", "15"))
-PRE_ROLL_MIN: int = int(os.getenv("PRE_ROLL_MIN", "1"))
-LOKI_LIMIT: int = int(os.getenv("LOKI_LIMIT", "2000"))
-MAX_LOG_CHARS: int = int(os.getenv("MAX_LOG_CHARS", "6000"))
-
-RATE_LIMIT_MAX: int = int(os.getenv("RATE_LIMIT_MAX", "8"))
-RATE_LIMIT_WINDOW_SEC: int = int(os.getenv("RATE_LIMIT_WINDOW_SEC", "60"))
-
-REQUEST_TIMEOUT_SEC: float = float(os.getenv("REQUEST_TIMEOUT_SEC", "30"))
-LOKI_RETRY_ATTEMPTS: int = int(os.getenv("LOKI_RETRY_ATTEMPTS", "2"))
-LOKI_RETRY_BACKOFF_SEC: float = float(os.getenv("LOKI_RETRY_BACKOFF_SEC", "1.0"))
-
-PROCESS_RESOLVED: bool = os.getenv("PROCESS_RESOLVED", "false").lower() == "true"
-
-LOG_FILTER_REGEX: str = os.getenv(
-    "LOG_FILTER_REGEX",
-    r"error|exception|timeout|fail|unavailable|panic|SEVERE|CRITICAL"
-)
-
-DEFAULT_FALLBACKS = [
-    '{{job="{job}"}}',
-    '{{service="{service}"}}',
-    '{{instance="{instance}"}}',
-    '{{namespace="{namespace}"}}',
-    '{{pod="{pod}"}}',
-    '{{container="{container}"}}',
-    '{{app="{app}"}}',
-    '{{job=~".+"}}'  # non-empty regex → always valid
-]
-try:
-    LOKI_FALLBACK_QUERIES: List[str] = json.loads(os.getenv("LOKI_FALLBACK_QUERIES", "[]"))
-    if not isinstance(LOKI_FALLBACK_QUERIES, list):
-        LOKI_FALLBACK_QUERIES = []
-except Exception:
-    LOKI_FALLBACK_QUERIES = []
-
-LOKI_CACHE_TTL_SEC: int = int(os.getenv("LOKI_CACHE_TTL_SEC", "20"))
-
-# ------------------ FastAPI ------------------
-app = FastAPI(title="LLM Relay (LangChain) → prom2teams", version="1.2.0")
-
-# ------------------ LangChain setup ------------------
-llm = ChatOllama(
-    model=OLLAMA_MODEL,
-    base_url=OLLAMA_URL,
-    temperature=OLLAMA_TEMPERATURE,
-)
-
-SYSTEM_PROMPT = """You are a senior SRE assistant.
-Given an Alertmanager payload and recent logs, return **Markdown** with four sections:
-
-# What happened
-- 3–6 bullets, concise and factual
-
-# Most likely causes (ranked)
-1. ...
-2. ...
-3. ...
-
-# Recommended actions (step-by-step)
-- Start with fastest checks / mitigations
-- Include commands or dashboards if relevant
-
-# Useful follow-up queries
-- LogQL: ...
-- PromQL: ...
-If information is missing, say exactly what to check or where to look.
-"""
-
-prompt = ChatPromptTemplate.from_messages([
-    ("system", SYSTEM_PROMPT),
-    ("human",
-     "Alert (JSON):\n{alert_json}\n\n"
-     "LogQL used:\n{logql}\n\n"
-     "Log summary:\n{log_stats}\n\n"
-     "Recent logs (newest first, truncated):\n{logs_excerpt}\n")
-])
-chain = prompt | llm | StrOutputParser()
-
-# ------------------ Pydantic models ------------------
-class Alert(BaseModel):
-    status: str
-    labels: Dict[str, Any] = Field(default_factory=dict)
-    annotations: Dict[str, Any] = Field(default_factory=dict)
-    startsAt: str
-    endsAt: Optional[str] = None
-    generatorURL: Optional[str] = None
-    fingerprint: Optional[str] = None
-
-class AlertBatch(BaseModel):
-    receiver: Optional[str] = "llm-relay"
-    status: str
-    alerts: List[Alert]
-    groupLabels: Optional[Dict[str, Any]] = None
-    commonLabels: Optional[Dict[str, Any]] = None
-    commonAnnotations: Optional[Dict[str, Any]] = None
-    externalURL: Optional[str] = None
-    version: Optional[str] = None
-    groupKey: Optional[str] = None
-
-# ------------------ Rate limiter ------------------
-_rate_cache: Dict[str, List[float]] = {}
-def rate_limited(key: str) -> bool:
-    now = time.time()
-    q = [t for t in _rate_cache.get(key, []) if now - t <= RATE_LIMIT_WINDOW_SEC]
-    if len(q) >= RATE_LIMIT_MAX:
-        _rate_cache[key] = q
-        return True
-    q.append(now); _rate_cache[key] = q
-    return False
-
-# ------------------ Loki helpers ------------------
-def to_dt(rfc3339: str) -> datetime:
-    return datetime.fromisoformat(rfc3339.replace("Z", "+00:00"))
-
-def parse_ends_at(ends_at: Optional[str]) -> Optional[datetime]:
-    if not ends_at:
-        return None
-    try:
-        dt = to_dt(ends_at)
-        if dt.year < 1971:
-            return None
-        return dt
-    except Exception:
-        return None
-
-def ns_epoch(dt: datetime) -> str:
-    return str(int(dt.timestamp() * 1e9))
-
-def _append_regex(selector: str) -> str:
-    regex = LOG_FILTER_REGEX.strip()
-    return f'{selector} |~ "{regex}"' if regex else selector
-
-def build_logql_candidates(labels: Dict[str, Any]) -> List[str]:
-    ns = labels.get("namespace") or labels.get("kubernetes_namespace") or ""
-    pod = labels.get("pod") or labels.get("kubernetes_pod_name") or ""
-    app_label = labels.get("app") or labels.get("app_kubernetes_io_name") or labels.get("job") or ""
-    container = labels.get("container") or labels.get("container_name") or ""
-    cluster = labels.get("cluster") or ""
-    job = labels.get("job") or ""
-    service = labels.get("service") or ""
-    instance = labels.get("instance") or ""
-
-    parts = []
-    if ns: parts.append(f'namespace="{ns}"')
-    if pod: parts.append(f'pod="{pod}"')
-    if container: parts.append(f'container="{container}"')
-    if app_label: parts.append(f'app="{app_label}"')
-    if cluster: parts.append(f'cluster="{cluster}"')
-    primary = "{" + ",".join(parts) + "}" if parts else '{job=~".+"}'
-
-    fallbacks = LOKI_FALLBACK_QUERIES or DEFAULT_FALLBACKS
-    fmt = {"namespace": ns, "pod": pod, "container": container, "app": app_label,
-           "cluster": cluster, "job": job, "service": service, "instance": instance}
-    rendered: List[str] = []
-    for tpl in fallbacks:
-        try:
-            s = tpl.format(**fmt)
-            if ('=""' in s) or ('=~""' in s) or ('=~".*"' in s):
-                continue
-            if s and s not in rendered:
-                rendered.append(s)
-        except Exception:
+def extract_first_json_object(s: str) -> dict | None:
+    """
+    Robustly extract the first top-level JSON object { ... } from free text.
+    Handles braces inside strings and escapes. Returns dict or None.
+    """
+    in_str = False
+    esc = False
+    depth = 0
+    start = -1
+    for i, ch in enumerate(s):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
             continue
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == '{':
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif ch == '}':
+                if depth > 0:
+                    depth -= 1
+                    if depth == 0 and start != -1:
+                        blob = s[start:i+1]
+                        try:
+                            return json.loads(blob)
+                        except Exception:
+                            # keep scanning in case later object is parseable
+                            start = -1
+    return None
 
-    candidates = [primary] + [s for s in rendered if s != primary]
-    candidates = [_append_regex(s) for s in candidates]
-    logger.debug("logql_candidates | %s", json.dumps({"candidates": candidates}, ensure_ascii=False))
-    return candidates
 
-_IP_PORT_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{2,5})?\b")
+def build_logql_selector(labels: Dict[str, str]) -> str:
+    """
+    Prefer pod+namespace, else namespace+job, else job, else instance.
+    """
+    ns = labels.get("namespace")
+    pod = labels.get("pod")
+    job = labels.get("job")
+    inst = labels.get("instance")
+    if ns and pod:
+        return f'{{namespace="{ns}", pod="{pod}"}}'
+    if ns and job:
+        return f'{{namespace="{ns}", job="{job}"}}'
+    if job:
+        return f'{{job="{job}"}}'
+    if inst:
+        return f'{{instance="{inst}"}}'
+    return '{job=~".*"}'  # fallback (kept safe by tight time window)
 
-def normalize_line(line: str) -> str:
-    line = re.sub(r"\b[0-9a-f]{7,40}\b", "<id>", line, flags=re.IGNORECASE)
-    line = re.sub(r"\b[0-9]{4,}\b", "<num>", line)
-    line = re.sub(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z?", "<ts>", line)
-    line = _IP_PORT_RE.sub("<ip>", line)
-    return line.strip()
+async def fetch_loki_logs(labels: Dict[str, str], starts_at: str, ends_at: str) -> Tuple[str, int]:
+    """
+    Query Loki /loki/api/v1/query_range within a small window around startsAt/endsAt.
+    Supports either Bearer token or BasicAuth (Basic used only if Bearer not set).
+    Returns (joined_text, line_count).
+    """
+    try:
+        start_dt = parse_time(starts_at)
+    except Exception:
+        start_dt = dt.datetime.utcnow() - dt.timedelta(minutes=15)
 
-def summarize_logs(raw_lines: List[str], top_n: int = 8) -> Tuple[str, str]:
-    if not raw_lines:
-        return "No matching logs in the time window.", ""
-    levels = {"error": 0, "warn": 0, "info": 0, "debug": 0}
-    for ln in raw_lines:
-        l = ln.lower()
-        if any(l.startswith(x) or f" {x} " in f" {l} " for x in ["error", "err", "level=error"]):
-            levels["error"] += 1
-        elif any(x in l for x in [" warn", "level=warn", "warning"]):
-            levels["warn"] += 1
-        elif any(x in l for x in [" info", "level=info"]):
-            levels["info"] += 1
-        elif any(x in l for x in [" debug", "level=debug"]):
-            levels["debug"] += 1
+    # decide end bound
+    if ends_at and ends_at != "0001-01-01T00:00:00Z":
+        end_dt = parse_time(ends_at)
+    else:
+        end_dt = dt.datetime.utcnow()
 
-    c = Counter(normalize_line(ln) for ln in raw_lines)
-    top = c.most_common(top_n)
+    start = start_dt - dt.timedelta(seconds=LOG_WINDOW_BEFORE_SEC)
+    end   = end_dt + dt.timedelta(seconds=LOG_WINDOW_AFTER_SEC)
 
-    stats = [
-        f"- Counts by level: error={levels['error']}, warn={levels['warn']}, info={levels['info']}, debug={levels['debug']}",
-        "- Top repeating messages:"
-    ]
-    for msg, cnt in top:
-        if not msg: continue
-        preview = msg if len(msg) < 160 else msg[:157] + "..."
-        stats.append(f"  - ({cnt}×) {preview}")
-
-    text = "\n".join(raw_lines)
-    excerpt = text[-MAX_LOG_CHARS:] if len(text) > MAX_LOG_CHARS else text
-    return "\n".join(stats), excerpt
-
-# ---- Loki query (timeout-safe) ----
-_loki_cache: Dict[str, Tuple[float, List[str]]] = {}
-
-def _httpx_timeout() -> httpx.Timeout:
-    return httpx.Timeout(connect=min(REQUEST_TIMEOUT_SEC, 10.0),
-                         read=REQUEST_TIMEOUT_SEC,
-                         write=REQUEST_TIMEOUT_SEC,
-                         pool=None)
-
-async def _do_loki_request(params: Dict[str, str], headers: Dict[str, str], auth: Optional[Tuple[str, str]]) -> Dict[str, Any]:
-    timeout = _httpx_timeout()
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        last_exc: Optional[Exception] = None
-        for attempt in range(1, LOKI_RETRY_ATTEMPTS + 1):
-            try:
-                r = await client.get(f"{LOKI_URL}/loki/api/v1/query_range", params=params, headers=headers, auth=auth)
-                if r.status_code != 200:
-                    raise HTTPException(502, f"Loki error: {r.text}")
-                return r.json()
-            except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.WriteTimeout) as e:
-                last_exc = e
-                logger.warning("loki_timeout | %s", json.dumps({"attempt": attempt, "params": params}, ensure_ascii=False))
-            except httpx.RequestError as e:
-                last_exc = e
-                logger.warning("loki_request_error | %s", json.dumps({"attempt": attempt, "error": str(e)}, ensure_ascii=False))
-            if attempt < LOKI_RETRY_ATTEMPTS:
-                await asyncio.sleep(LOKI_RETRY_BACKOFF_SEC * attempt)
-        if isinstance(last_exc, httpx.ReadTimeout):
-            raise HTTPException(504, f"Loki timeout after {LOKI_RETRY_ATTEMPTS} attempt(s)")
-        raise HTTPException(502, f"Loki request failed: {type(last_exc).__name__}: {last_exc}")
-
-async def query_loki(logql: str, start: datetime, end: datetime) -> List[str]:
-    key = f"{logql}|{int(start.timestamp())}|{int(end.timestamp())}"
-    now = time.time()
-    cached = _loki_cache.get(key)
-    if cached and now - cached[0] <= LOKI_CACHE_TTL_SEC:
-        logger.debug("loki_cache_hit | %s", json.dumps({"key": key}, ensure_ascii=False))
-        return cached[1]
+    params = {
+        "query": build_logql_selector(labels),
+        "start": str(to_ns(start)),
+        "end":   str(to_ns(end)),
+        "limit": str(MAX_LOG_LINES),
+        "direction": "backward",  # newest first
+    }
 
     headers: Dict[str, str] = {}
     if LOKI_TENANT_ID:
         headers["X-Scope-OrgID"] = LOKI_TENANT_ID
-    auth = None
     if LOKI_BEARER_TOKEN:
         headers["Authorization"] = f"Bearer {LOKI_BEARER_TOKEN}"
-    elif LOKI_BASIC_USER and LOKI_BASIC_PASS:
-        auth = (LOKI_BASIC_USER, LOKI_BASIC_PASS)
 
-    params = {
-        "query": logql,
-        "start": ns_epoch(start),
-        "end": ns_epoch(end),
-        "direction": "backward",
-        "limit": str(LOKI_LIMIT),
-    }
-    data = await _do_loki_request(params, headers, auth)
-    streams = data.get("data", {}).get("result", [])
+    # Decide auth mechanism: Bearer takes precedence; otherwise Basic if provided
+    auth = None
+    if not LOKI_BEARER_TOKEN and LOKI_BASIC_USER and LOKI_BASIC_PASS:  # NEW
+        auth = httpx.BasicAuth(LOKI_BASIC_USER, LOKI_BASIC_PASS)
+
+    url = f"{LOKI_URL}/loki/api/v1/query_range"
+    async with httpx.AsyncClient(timeout=20, auth=auth) as client:  # NEW (auth=auth)
+        r = await client.get(url, params=params, headers=headers)
+        r.raise_for_status()
+        data = r.json()
 
     lines: List[str] = []
-    for st in streams:
-        for _ts, line in st.get("values", []):
-            lines.append(line.rstrip())
+    for stream in data.get("data", {}).get("result", []):
+        for _, line in stream.get("values", []):
+            lines.append(line)
+    lines = lines[:MAX_LOG_LINES]
 
-    _loki_cache[key] = (now, lines)
-    _j("loki_query_done", logql=logql, start=start.isoformat(), end=end.isoformat(), lines=len(lines))
-    if lines and LOG_LINES_SAMPLE > 0:
-        sample = lines[:LOG_LINES_SAMPLE]
-        logger.debug("loki_lines_sample | %s", _truncate("\n".join(sample)))
-    return lines
+    return "\n".join(lines), len(lines)
 
-async def query_loki_with_fallbacks(labels: Dict[str, Any], starts_at: datetime, ends_at: Optional[datetime]) -> Tuple[str, List[str]]:
-    end = ends_at or datetime.now(timezone.utc)
-    start = max(starts_at - timedelta(minutes=PRE_ROLL_MIN), end - timedelta(minutes=LOG_WINDOW_MIN))
-    candidates = build_logql_candidates(labels)
-    _j("loki_candidates_built", candidates=candidates, start=start.isoformat(), end=end.isoformat())
-
-    for candidate in candidates:
-        try:
-            lines = await query_loki(candidate, start, end)
-        except HTTPException as e:
-            _j("loki_candidate_failed", candidate=candidate, error=str(e))
-            continue
-        if lines:
-            _j("loki_candidate_selected", candidate=candidate, lines=len(lines))
-            return candidate, lines
-
-    base = candidates[0]
-    if '|~' in base:
-        plain = base.split('|~')[0].strip()
-        try:
-            lines = await query_loki(plain, start, end)
-            if lines:
-                _j("loki_no_regex_fallback_selected", candidate=plain, lines=len(lines))
-                return plain, lines
-        except HTTPException as e:
-            _j("loki_no_regex_fallback_failed", candidate=plain, error=str(e))
-
-    _j("loki_no_lines_found", candidate=base)
-    return base, []
-
-# ------------------ prom2teams forward ------------------
-async def forward_to_prom2teams(batch: Dict[str, Any]) -> int:
-    url = f"{P2T_BASE}/v2/{P2T_CONNECTOR}"
-    try:
-        async with httpx.AsyncClient(timeout=_httpx_timeout()) as client:
-            r = await client.post(url, json=batch)
-            _j("forward_to_prom2teams_done", status=r.status_code)
-            return r.status_code
-    except httpx.HTTPError as e:
-        _j("forward_to_prom2teams_error", error=str(e))
-        return -1
-
-# ------------------ Routes ------------------
-@app.get("/healthz")
-async def healthz():
-    _j("healthz", model=OLLAMA_MODEL)
-    return {
-        "ok": True,
-        "model": OLLAMA_MODEL,
-        "process_resolved": PROCESS_RESOLVED,
-        "log_filter_regex": LOG_FILTER_REGEX,
-        "cache_ttl_sec": LOKI_CACHE_TTL_SEC,
-        "loki_retries": LOKI_RETRY_ATTEMPTS,
-        "loki_backoff_sec": LOKI_RETRY_BACKOFF_SEC,
+def make_user_prompt(alert: Dict[str, Any], logs_text: str) -> str:
+    body = {
+        "status": alert.get("status"),
+        "labels": alert.get("labels", {}),
+        "annotations": alert.get("annotations", {}),
     }
+    return (
+        "ALERT:\n" + json.dumps(body, ensure_ascii=False) +
+        "\n\nRECENT LOG LINES (truncated):\n" + clamp(logs_text, 12000)
+    )
 
-# ---- Ad-hoc explainer ----
-class ExplainReq(BaseModel):
-    labels: Dict[str, Any] = Field(default_factory=dict)
-    startsAt: Optional[str] = None
-    endsAt: Optional[str] = None
-    minutes: int = LOG_WINDOW_MIN
+def _build_prompt_for_generate(alert: dict, logs_text: str) -> str:
+    # Collapse system+user into a single prompt for /api/generate
+    SYSTEM_PROMPT = (
+        "You are an SRE/DevOps assistant. Given a Prometheus Alert and recent logs, "
+        "produce ONLY a JSON object with fields: "
+        "summary, root_causes (array), runbook (array), confidence (0..1). "
+        "If evidence is weak, say so. Prefer safe, low-risk checks first. "
+        "No prose outside JSON.\n"
+    )
+    from json import dumps
+    user = (
+        "ALERT:\n" + dumps({
+            "status": alert.get("status"),
+            "labels": alert.get("labels", {}),
+            "annotations": alert.get("annotations", {}),
+        }, ensure_ascii=False)
+        + "\n\nRECENT LOG LINES (truncated):\n" + logs_text
+        + "\n\nReturn ONLY valid JSON."
+    )
+    return SYSTEM_PROMPT + "\n" + user
 
-@app.post("/explain")
-async def explain(req: ExplainReq):
-    starts_at = to_dt(req.startsAt) if req.startsAt else (datetime.now(timezone.utc) - timedelta(minutes=req.minutes))
-    ends_at = parse_ends_at(req.endsAt)
-    _j("explain_request", labels=req.labels, startsAt=starts_at.isoformat(), endsAt=(ends_at.isoformat() if ends_at else None))
+async def call_ollama(alert: dict, logs_text: str) -> dict | None:
+
+    logs_for_llm = clamp_for_llm(logs_text)  # <-- clamp aggressively
+
+    async def _chat() -> dict | None:
+        url = f"{OLLAMA_URL}/api/chat"
+        payload = {
+            "model": OLLAMA_MODEL,
+            "stream": False,
+            "options": {"num_ctx": OLLAMA_NUM_CTX},  # hint; model may cap lower
+            "messages": [
+                {"role": "system", "content":
+                    "You are an SRE/DevOps assistant. Return ONLY JSON with "
+                    "fields: summary, root_causes[], runbook[], confidence (0..1)."},
+                {"role": "user", "content":
+                    "ALERT:\n" + json.dumps({
+                        "status": alert.get("status"),
+                        "labels": alert.get("labels", {}),
+                        "annotations": alert.get("annotations", {}),
+                    }, ensure_ascii=False)
+                    + "\n\nRECENT LOG LINES (truncated):\n" + logs_for_llm
+                    + "\n\nReturn ONLY valid JSON."}
+            ]
+        }
+        async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT_S) as client:
+            r = await client.post(url, json=payload)
+            r.raise_for_status()
+            data = r.json()
+        content = (data.get("message") or {}).get("content", "").strip()
+        # robust parse
+        obj = extract_first_json_object(content)
+        return obj
+
+    def _build_prompt_for_generate() -> str:
+        sys = (
+            "You are an SRE/DevOps assistant. Given a Prometheus Alert and recent logs, "
+            "produce ONLY a JSON object with fields: "
+            "summary, root_causes (array), runbook (array), confidence (0..1). "
+            "If evidence is weak, say so. Prefer safe checks first. No prose outside JSON.\n"
+        )
+        usr = (
+            "ALERT:\n" + json.dumps({
+                "status": alert.get("status"),
+                "labels": alert.get("labels", {}),
+                "annotations": alert.get("annotations", {}),
+            }, ensure_ascii=False)
+            + "\n\nRECENT LOG LINES (truncated):\n" + logs_for_llm
+            + "\n\nReturn ONLY valid JSON."
+        )
+        return sys + "\n" + usr
+
+    async def _generate() -> dict | None:
+        url = f"{OLLAMA_URL}/api/generate"
+        payload = {
+            "model": OLLAMA_MODEL,
+            "prompt": _build_prompt_for_generate(),
+            "stream": False,
+            "options": {"num_ctx": OLLAMA_NUM_CTX},  # hint
+        }
+        async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT_S) as client:
+            r = await client.post(url, json=payload)
+            r.raise_for_status()
+            data = r.json()
+        content = (data.get("response") or "").strip()
+        obj = extract_first_json_object(content)  # robust parse
+        return obj
 
     try:
-        logql, lines = await query_loki_with_fallbacks(req.labels, starts_at, ends_at)
-        log_stats, excerpt = summarize_logs(lines)
-    except HTTPException as e:
-        logql = "(invalid or rejected by Loki)"
-        log_stats = f"Loki query failed: {getattr(e, 'detail', str(e))}"
-        excerpt = ""
-
-    try:
-        _j("llm_invoke_start", route="explain")
-        t0 = time.time()
-        text = await asyncio.wait_for(chain.ainvoke({
-            "alert_json": json.dumps({"labels": req.labels, "startsAt": starts_at.isoformat(), "endsAt": (ends_at.isoformat() if ends_at else None)}, indent=2),
-            "logql": logql,
-            "log_stats": log_stats,
-            "logs_excerpt": excerpt or "(no logs)",
-        }), timeout=LLM_TIMEOUT_SEC)
-        dt_ms = int((time.time() - t0) * 1000)
-        _j("llm_invoke_done", latency_ms=dt_ms, preview=_truncate(text))
-    except asyncio.TimeoutError:
-        text = ("LLM timeout while generating explanation. Review the log summary and try again with a narrower window.")
-        _j("llm_timeout", route="explain")
-    except Exception as e:
-        text = f"LLM generation failed: {type(e).__name__}: {e}"
-        _j("llm_error", error=str(e), route="explain")
-
-    return {"logql": logql, "stats": log_stats, "explanation": text}
-
-# ------------------ Alert path ------------------
-@app.post("/alert")
-async def handle_alert(batch: AlertBatch):
-    # Batch-level log
-    summary = {
-        "receiver": batch.receiver,
-        "status": batch.status,
-        "alerts": len(batch.alerts),
-        "groupKey": batch.groupKey,
-        "groupLabels": batch.groupLabels,
-    }
-    _j("alert_batch_received", **summary)
-    if LOG_PAYLOAD_FULL:
-        # Full payload (truncated to avoid huge lines)
-        logger.debug("alert_batch_payload | %s", _truncate(json.dumps(batch.model_dump(), default=str, ensure_ascii=False), 10 * LOG_EXCERPT_CHARS))
-
-    async def process_alert(a: Alert) -> Alert:
-        is_resolved = (a.status or "").lower() == "resolved"
-        key = f"{a.labels.get('alertname','')}|{a.labels.get('namespace','')}|{a.labels.get('instance','')}"
-        limited = rate_limited(key)
-        try:
-            starts_at = to_dt(a.startsAt)
-        except Exception:
-            starts_at = datetime.now(timezone.utc) - timedelta(minutes=LOG_WINDOW_MIN)
-        ends_at = parse_ends_at(a.endsAt)
-
-        _j("alert_processing_start",
-           key=key, resolved=is_resolved, rate_limited=limited,
-           startsAt=starts_at.isoformat(), endsAt=(ends_at.isoformat() if ends_at else None),
-           labels=a.labels)
-
-        # Skip resolved unless configured
-        if is_resolved and not PROCESS_RESOLVED:
-            a.annotations = a.annotations or {}
-            a.annotations["llm_recommendation"] = "Alert is resolved; skipping analysis."
-            a.annotations["llm_logql"] = "(skipped)"
-            a.annotations["llm_log_stats"] = "Resolved alert; no action required."
-            _j("alert_skipped_resolved", key=key)
-            return a
-
-        recommendation = ""
-        logql_used = ""
-        excerpt = ""
-        log_stats = "Rate-limited; skipping LLM/logs." if limited else ""
-
-        if limited:
-            recommendation = "Rate limit reached for this alert key. LLM suggestion was skipped to protect capacity."
-            _j("alert_rate_limited", key=key)
+        if OLLAMA_API_STYLE == "chat":
+            return await _chat()
+        elif OLLAMA_API_STYLE == "generate":
+            return await _generate()
         else:
             try:
-                logql_used, lines = await query_loki_with_fallbacks(a.labels, starts_at, ends_at)
-                log_stats, excerpt = summarize_logs(lines)
-                _j("loki_summary",
-                   key=key, logql=logql_used, lines=len(lines),
-                   stats_preview=_truncate(log_stats))
-            except HTTPException as e:
-                logql_used = "(invalid or rejected by Loki)"
-                log_stats = f"Loki query failed: {getattr(e, 'detail', str(e))}"
-                excerpt = ""
-                _j("loki_error", key=key, error=str(e))
-
-            inputs = {
-                "alert_json": json.dumps(a.model_dump(), indent=2, default=str),
-                "logql": logql_used or "(no query)",
-                "log_stats": log_stats,
-                "logs_excerpt": excerpt or "(no matching logs found)",
-            }
-            try:
-                _j("llm_invoke_start", route="alert", key=key)
-                t0 = time.time()
-                recommendation = await asyncio.wait_for(chain.ainvoke(inputs), timeout=LLM_TIMEOUT_SEC)
-                dt_ms = int((time.time() - t0) * 1000)
-                _j("llm_invoke_done", route="alert", key=key, latency_ms=dt_ms, preview=_truncate(recommendation))
-                log_stats += f"\n- LLM latency: {dt_ms} ms"
-            except asyncio.TimeoutError:
-                recommendation = "LLM generation timed out. Use the follow-up queries to continue the investigation."
-                _j("llm_timeout", route="alert", key=key)
+                return await _chat()
             except Exception as e:
-                recommendation = f"LLM generation failed: {type(e).__name__}: {e}"
-                _j("llm_error", route="alert", key=key, error=str(e))
+                log.warning("chat endpoint failed (%s), falling back to /api/generate", e)
+                return await _generate()
+    except httpx.ReadTimeout as e:
+        log.error("Ollama timeout: %s; falling back/returning None", e)
+        if OLLAMA_API_STYLE == "chat":
+            try:
+                return await _generate()
+            except Exception:
+                return None
+        elif OLLAMA_API_STYLE == "generate":
+            try:
+                return await _chat()
+            except Exception:
+                return None
+        return None
+    except Exception as e:
+        log.exception("Ollama request failed: %s", e)
+        return None
 
-        a.annotations = a.annotations or {}
-        a.annotations["llm_recommendation"] = recommendation
-        a.annotations["llm_logql"] = logql_used or "(no query)"
-        a.annotations["llm_log_stats"] = log_stats
-        _j("alert_processing_done", key=key, has_recommendation=bool(recommendation))
-        return a
 
-    processed_alerts = await asyncio.gather(*(process_alert(a) for a in batch.alerts))
-    out_batch = batch.model_dump()
-    out_batch["alerts"] = [a.model_dump() for a in processed_alerts]
+async def forward_to_prom2teams(enriched_payload: Dict[str, Any]) -> Tuple[int, str]:
+    """
+    Forward the fully enriched payload (with per-alert annotations containing llm* fields)
+    to prom2teams /v2/<connector>.
+    """
+    url = f"{PROM2TEAMS_BASE}/"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(url, json=enriched_payload)
+            text = ""
+            try:
+                text = (await r.aread()).decode("utf-8", errors="ignore")[:2048]
+            except Exception:
+                pass
+            return r.status_code, text
+    except Exception as e:
+        log.exception("forward to prom2teams failed: %s", e)
+        return 0, str(e)
 
-    forward_status = await forward_to_prom2teams(out_batch)
-    _j("alert_batch_forwarded", count=len(processed_alerts), status=forward_status)
-    # Always 200 so Alertmanager doesn't retry the webhook forever
-    return {"ok": True, "forward_status": forward_status, "alerts": len(processed_alerts)}
+# -------- FastAPI endpoints --------
+@app.get("/health")
+async def health():
+    return {"ok": True}
+
+@app.post(ALERT_WEBHOOK_PATH)
+async def alert_receiver(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid json"}, status_code=400)
+
+    alerts: List[Dict[str, Any]] = payload.get("alerts", [])
+
+    async def enrich(a: Dict[str, Any]) -> bool:
+        """
+        Enrich a single alert with llm* fields and a combined `llm_response` string in annotations.
+        """
+        try:
+            labels   = a.get("labels", {})
+            startsAt = a.get("startsAt", "")
+            endsAt   = a.get("endsAt", "")
+            logs_text, line_count = await fetch_loki_logs(labels, startsAt, endsAt)
+            llm_json = await call_ollama(a, logs_text)
+
+            ann = a.setdefault("annotations", {})
+            if llm_json:
+                summary     = llm_json.get("summary", "")
+                root_causes = llm_json.get("root_causes") or []
+                runbook     = llm_json.get("runbook") or []
+                try:
+                    conf = float(llm_json.get("confidence", 0.0))
+                except Exception:
+                    conf = 0.0
+
+                # Individual llm* fields
+                ann["llm_summary"]      = summary
+                ann["llm_root_causes"]  = " • ".join(map(str, root_causes[:6]))
+                # ann["llm_runbook"]      = "\n".join(f"{i+1}. {step}" for i, step in enumerate(map(str, runbook[:12])))
+                # ann["llm_confidence"]   = f"{conf:.2f}"
+                # ann["llm_model"]        = OLLAMA_MODEL
+                # # ann["llm_logs_used"]    = f"{'\n'.join(logs_text.splitlines()[:5])}\n...[{line_count} lines], sha1={sha1(logs_text)}"
+                # sample = "\n".join(logs_text.splitlines()[:5])
+                # ann["llm_logs_used"]    = f"{sample}\n...[{line_count} lines], sha1={sha1(logs_text)}"
+
+                # Combined single-field string (for easy consumption)  # NEW
+                combined = {
+                    "summary": summary,
+                    "root_causes": root_causes,
+                    "runbook": runbook,
+                    "confidence": conf,
+                    "model": OLLAMA_MODEL,
+                }
+                # ann["llm_response"] = json.dumps(combined, ensure_ascii=False)  # NEW
+            else:
+                ann["llm_summary"]     = "AI suggestion unavailable (empty logs or model error)."
+                ann["llm_root_causes"] = ""
+                # ann["llm_runbook"]     = ""
+                # ann["llm_confidence"]  = "0.00"
+                # ann["llm_model"]       = OLLAMA_MODEL
+                # # ann["llm_logs_used"]   = f"{'\n'.join(logs_text.splitlines()[:5])}\n...[{line_count} lines], sha1={sha1(logs_text)}"
+                # sample = "\n".join(logs_text.splitlines()[:5])
+                # ann["llm_logs_used"]    = f"{sample}\n...[{line_count} lines], sha1={sha1(logs_text)}"
+                # ann["llm_response"]    = json.dumps({  # NEW
+                #     "summary": ann["llm_summary"],
+                #     "root_causes": [],
+                #     "runbook": [],
+                #     "confidence": 0.0,
+                #     "model": OLLAMA_MODEL,
+                # }, ensure_ascii=False)
+
+            return True
+        except Exception as e:
+            log.exception("enrich failed: %s", e)
+            return False
+
+    results = await asyncio.gather(*(enrich(a) for a in alerts))
+
+    # Forward the SAME 'payload' object; each alert now has llm* inside annotations
+    status, pt_text = await forward_to_prom2teams(payload)
+
+    return JSONResponse({
+        "enriched_alerts": sum(1 for x in results if x),
+        "prom2teams_status": status,
+        "prom2teams_reply": pt_text,
+    }, status_code=200)
+
+# Run with: uvicorn app:app --host 0.0.0.0 --port 8080
